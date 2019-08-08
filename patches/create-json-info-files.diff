@@ -1,0 +1,193 @@
+diff --git a/include/image.mk b/include/image.mk
+index e55ac22d0dc..48b7d7ccfab 100644
+--- a/include/image.mk
++++ b/include/image.mk
+@@ -554,7 +554,28 @@ define Device/Build/image
+ 
+   $(BIN_DIR)/$(call IMAGE_NAME,$(1),$(2)): $(KDIR)/tmp/$(call IMAGE_NAME,$(1),$(2))
+ 	cp $$^ $$@
+-
++	$(if $(CONFIG_CREATE_JSON), \
++		DEVICE_ID="$(DEVICE_NAME)" \
++		TOPDIR="$(TOPDIR)" \
++		BIN_DIR="$(BIN_DIR)" \
++		IMAGE_NAME="$(IMAGE_NAME)" \
++		IMAGE_TYPE=$(word 1,$(subst ., ,$(2))) \
++		IMAGE_SIZE="$(IMAGE_SIZE)" \
++		IMAGE_PREFIX="$(IMAGE_PREFIX)" \
++		DEVICE_TITLE="$(DEVICE_TITLE)" \
++		DEVICE_VENDOR="$(DEVICE_VENDOR)" \
++		DEVICE_MODEL="$(DEVICE_MODEL)" \
++		DEVICE_VARIANT="$(DEVICE_VARIANT)" \
++		DEVICE_ALT0_TITLE="$(DEVICE_ALT0_TITLE)" \
++		DEVICE_ALT1_TITLE="$(DEVICE_ALT1_TITLE)" \
++		DEVICE_ALT2_TITLE="$(DEVICE_ALT2_TITLE)" \
++		TARGET="$(BOARD)" \
++		SUBTARGET="$(SUBTARGET)" \
++		VERSION_NUMBER="$(VERSION_NUMBER)" \
++		VERSION_CODE="$(VERSION_CODE)" \
++		SUPPORTED_DEVICES="$(SUPPORTED_DEVICES)" \
++		$(TOPDIR)/scripts/json_device_add.py \
++	)
+ endef
+ 
+ define Device/Build/artifact
+@@ -572,6 +593,8 @@ define Device/Build/artifact
+ endef
+ 
+ define Device/Build
++  $(if $(CONFIG_CREATE_JSON), $(shell rm -rf $(BIN_DIR)/$(IMAGE_PREFIX).json))
++
+   $(if $(CONFIG_TARGET_ROOTFS_INITRAMFS),$(call Device/Build/initramfs,$(1)))
+   $(call Device/Build/kernel,$(1))
+ 
+diff --git a/scripts/json_device_add.py b/scripts/json_device_add.py
+new file mode 100755
+index 00000000000..c7a2cd64bb8
+--- /dev/null
++++ b/scripts/json_device_add.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++
++import json
++import os
++import hashlib
++
++
++def e(variable):
++    return os.environ.get(variable)
++
++
++json_path = "{}{}{}.json".format(e("BIN_DIR"), os.sep, e("IMAGE_PREFIX"))
++
++with open(os.path.join(e("BIN_DIR"), e("IMAGE_NAME")), "rb") as image_file:
++    image_hash = hashlib.sha256(image_file.read()).hexdigest()
++
++if not os.path.exists(json_path):
++    device_info = {
++        "id": e("DEVICE_ID"),
++        "title": list(
++            filter(
++                None,
++                [
++                    e("DEVICE_TITLE"),
++                    e("DEVICE_ALT0_TITLE"),
++                    e("DEVICE_ALT1_TITLE"),
++                    e("DEVICE_ALT2_TITLE"),
++                ],
++            )
++        ),
++        "vendor": e("DEVICE_VENDOR"),
++        "model": e("DEVICE_MODEL"),
++        "variant": e("DEVICE_VARIANT"),
++        "version_number": e("VERSION_NUMBER"),
++        "version_commit": e("VERSION_CODE"),
++        "supported_devices": e("SUPPORTED_DEVICES").split(),
++        "target": e("TARGET"),
++        "subtarget": e("SUBTARGET"),
++        "image_size": e("IMAGE_SIZE"),
++        "images": [],
++        "metadata_version": 1,
++    }
++else:
++    with open(json_path, "r") as json_file:
++        device_info = json.load(json_file)
++
++image_info = {"type": e("IMAGE_TYPE"), "name": e("IMAGE_NAME"), "sha256": image_hash}
++device_info["images"].append(image_info)
++
++with open(json_path, "w") as json_file:
++    json.dump(device_info, json_file, sort_keys=True, indent="  ")
+diff --git a/scripts/json_device_merge.py b/scripts/json_device_merge.py
+new file mode 100755
+index 00000000000..6e3470a311b
+--- /dev/null
++++ b/scripts/json_device_merge.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++
++import json
++import glob
++import os
++import hashlib
++
++bin_dir = os.path.join(os.environ["TOPDIR"], "bin")
++
++dev_overview = {"metadata_version": 1, "devices": {}}
++
++# find all json files in ./bin/targets and create sha256 checksums
++targets_dir = os.path.join(bin_dir, "targets")
++
++for root, dirs, files in os.walk(targets_dir):
++    # remove leading $TOPDIR/bin/targets/ and split on os.sep
++    target_split = root[len(targets_dir) + 1 :].split(os.sep)
++    # check is target_split contains exaclty two items (target, subtarget)
++    if len(target_split) == 2:
++        # initialize maps.json for target/subtarget
++        dev_map = {
++            "metadata_version": 1,
++            "target": target_split[0],
++            "subtarget": target_split[1],
++            "devices": {},
++        }
++        for file in files:
++            # ignore existing map.json files
++            if file.endswith(".json") and file != "map.json":
++                # load device info
++                with open(os.path.join(root, file), "r") as dev_file:
++                    dev_info = json.load(dev_file)
++
++                # generate sha256sum
++                with open(os.path.join(root, file), "rb") as dev_file_b:
++                    dev_sha256 = hashlib.sha256(dev_file_b.read()).hexdigest()
++
++                # generate map entry for each supported device
++                for supported in dev_info["supported_devices"]:
++                    dev_map["devices"][supported] = {}
++                    dev_map["devices"][supported]["id"] = dev_info["id"]
++                    dev_map["devices"][supported]["sha256"] = dev_sha256
++
++                # path from overview.json to device info files
++                dev_path = "{}/{}/{}".format(
++                    dev_info["target"], dev_info["subtarget"], file
++                )
++
++                # add title(s) to overview
++                for title in dev_info.get("title"):
++                    if title in dev_overview["devices"]:
++                        print(
++                            "WARNING: {} already exists in overview and will be overwritten".format(
++                                title
++                            )
++                        )
++                    dev_overview["devices"][title] = dev_path
++
++        # write map.json to target/subtarget
++        with open(os.path.join(root, "map.json"), "w") as dev_map_file:
++            json.dump(dev_map, dev_map_file, sort_keys=True, indent="  ")
++
++# write overview.json to ./bin/
++with open(os.path.join(bin_dir, "overview.json"), "w") as dev_overview_file:
++    json.dump(dev_overview, dev_overview_file, sort_keys=True, indent="  ")
+diff --git a/Makefile b/Makefile
+index 53018830615..46e9ea049ef 100644
+--- a/Makefile
++++ b/Makefile
+@@ -118,6 +118,7 @@ _call_image: staging_dir/host/.prereq-build
+ 	$(MAKE) -s prepare_rootfs
+ 	$(MAKE) -s build_image
+ 	$(MAKE) -s checksum
++	$(if $(CONFIG_MERGE_JSON),$(MAKE) -s jsondevicemerge)
+ 
+ _call_manifest: FORCE
+ 	rm -rf $(TARGET_DIR)
+@@ -201,6 +202,9 @@ image:
+ 		$(if $(BIN_DIR),BIN_DIR="$(BIN_DIR)") \
+ 		$(if $(DISABLED_SERVICES),DISABLED_SERVICES="$(DISABLED_SERVICES)"))
+ 
++jsondevicemerge: FORCE
++	$(SCRIPT_DIR)/json_device_merge.py
++
+ manifest: FORCE
+ 	$(MAKE) -s _check_profile
+ 	(unset PROFILE FILES PACKAGES MAKEFLAGS; \
